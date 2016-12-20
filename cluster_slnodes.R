@@ -7,7 +7,7 @@
 require(sp)
 require(rgdal)
 require(rgeos)
-require(fpc)
+require(dbscan)
 
 #' @title 
 #' cluster_slnodes
@@ -41,7 +41,7 @@ cluster_slnodes <- function(sldf, eps, MinPts){
   
   # Neighborhoods with DBSCAN Algorithm
   # see: https://en.wikipedia.org/wiki/DBSCAN
-  DBSCAN <- dbscan(points@coords, eps = eps, MinPts = MinPts)
+  DBSCAN <- dbscan::dbscan(points@coords, eps = eps, minPts = MinPts, borderPoints = F)
   
   #Identify core of each cluster
   clusters <- unique(DBSCAN$cluster[DBSCAN$cluster != 0]) # 0 is cluster of 'noise' / solitary points
