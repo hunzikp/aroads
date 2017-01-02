@@ -21,6 +21,7 @@ library(maptools)
 library(igraph)
 library(viridisLite)
 library(ggplot2)
+library(gridExtra)
 source("sldf2graph.R")
 
 
@@ -29,27 +30,86 @@ source("sldf2graph.R")
 ######################################################################################
 
 # Generate simplified network with nodes at intersections & endpoints only
-simplify_network <- function(graph){
+simplify_network <- function(graph) {
   
   # Find all vertices with only two edges
   edge.num <- unlist(lapply(V(graph), function(x){length(incident(graph, v = x, mode = c("all")))}))
   vertices.bridge <- which(edge.num == 2)
   
+  E(graph)$id <- 1:length(E(graph))
+  reference.ls <- vector("list", length(vertices.bridge))
+  
+  out.graph <- graph
+  
   # Sequentially (!) delete old edges and replace them with a bridging one
+  new.id <- max(E(graph)$id) + 1
+  cntr <- 1
   for(v in vertices.bridge){
-    these.neighbors <- neighbors(graph, v, mode =  "all")
-    old.edges <- E(graph)[from(v)]
+    these.neighbors <- neighbors(out.graph, v, mode =  "all")
+    old.edges <- E(out.graph)[from(v)]
+    old.ids <- old.edges$id
+    
     # Add new edge
-    graph <- add_edges(graph, these.neighbors,
-                       attr = list(weight = sum(edge_attr(graph, "weight", old.edges))))
+    out.graph <- add_edges(out.graph, these.neighbors,
+                       attr = list(weight = sum(edge_attr(out.graph, "weight", old.edges)), id=new.id))
+    
     # Delede old edges
-    graph <- delete.edges(graph, E(graph)[from(v)])
+    out.graph <- delete.edges(out.graph, E(out.graph)[from(v)])
+    
+    # Update reference list
+    reference.ls[[cntr]] <- cbind(new.id, old.ids)
+    
+    # Increase id
+    new.id <- new.id + 1
+    cntr <- cntr + 1
   }
   
   # Delete now unconnected vertices
-  graph <- delete.vertices(graph, c(vertices.bridge, which(edge.num == 0)))
+  out.graph <- delete.vertices(out.graph, c(vertices.bridge, which(edge.num == 0)))
   
-  return(graph)
+  # Make reference table
+  reference.mat <- do.call("rbind", reference.ls)
+  reference.df <- data.frame(original.id=E(graph)$id, new.id=NA)
+  replaced.edges <- E(graph)$id[E(graph)$id %in% reference.mat[,2]]
+  reference.df$new.id[!(reference.df$original.id %in% replaced.edges)] <- reference.df$original.id[!(reference.df$original.id %in% replaced.edges)]
+  for (i in 1:length(replaced.edges)) {
+    original.id <- replaced.edges[i]
+    parent.id <- reference.mat[reference.mat[,2]==original.id,1]
+    hasparent <- TRUE
+    while (hasparent) {
+      candidate.parent.id <- reference.mat[reference.mat[,2]==parent.id,1]
+      hasparent <- length(candidate.parent.id) > 0
+      if (hasparent) {
+        parent.id <- candidate.parent.id
+      }
+    }
+    reference.df$new.id[reference.df$original.id==original.id] <- parent.id
+  }
+  
+  return(list(out.graph, reference.df))
+}
+
+realvertex_edge_betweenness <- function(graph, normalize=FALSE) {
+  
+  ## Simplify and get reference table
+  simple.graph.ls <- simplify_network(graph)
+  simple.graph <- simple.graph.ls[[1]]
+  reference.df <- simple.graph.ls[[2]]
+  
+  ## Calculate edge betweenness on simplified graph
+  ebc.simple <- edge_betweenness(simple.graph)
+  if (normalize) {
+    ebc.simple <- ebc.simple / ((length(V(simple.graph))-1)*(length(V(simple.graph))-2))
+  }
+  
+  ## Merge simple ebc back to original edges
+  simple.ebc.df <- data.frame(new.id=E(simple.graph)$id, ebc=ebc.simple)
+  reference.df <- merge(reference.df, simple.ebc.df, by="new.id", all.x=TRUE, all.y=FALSE)
+  
+  ## Order and out
+  reference.df <- reference.df[order(reference.df$original.id),]
+  ebc <- reference.df$ebc
+  return(ebc)
 }
 
 
@@ -65,6 +125,8 @@ unified.ls <- full.list
 # AGE VS EBC ANALYSIS
 ######################################################################################
 
+ebc.plot.ls <- vector("list", length(unified.ls))
+age.plot.ls <- vector("list", length(unified.ls))
 for (cc in 1:length(unified.ls)) {
   
   ## Get this country's sldf and polygon
@@ -72,6 +134,7 @@ for (cc in 1:length(unified.ls)) {
   this.gwid <- as.numeric(sub("c", "", names(unified.ls)[cc]))
   cshp.all <- cshp(as.Date("2003-12-31"))
   this.cshp <- cshp.all[cshp.all$GWCODE == this.gwid,]
+  this.name <- as.character(this.cshp$CNTRY_NAME)
   
   ## Split unified into yearly SLDFs and calculate road age
   unified.col.names <- names(unified.sldf)
@@ -97,18 +160,19 @@ for (cc in 1:length(unified.ls)) {
   ## Calculate EBC for most recent network
   newest.sldf <- road.panel.ls[[length(road.panel.ls)]]
   newest.graph <- sldf2graph(newest.sldf)
-  edge.bc <- edge_betweenness(newest.graph, e = E(newest.graph), directed = F, weights=E(newest.graph)$length)
-  edge.bc.norm <- (edge.bc / ((length(V(newest.graph))-1)*(length(V(newest.graph))-2)))*100
+  E(newest.graph)$weight <- E(newest.graph)$length
+  ebc <- realvertex_edge_betweenness(newest.graph, normalize=TRUE) 
+  ebc <- ebc*100
   
   ## Plot normalized edge betweenness
   newest.sldf <- spChFIDs(newest.sldf, rownames(newest.sldf@data))
   shp.df    <- data.frame(id=rownames(newest.sldf@data),
-                          values=edge.bc.norm,
+                          values=ebc,
                           newest.sldf@data, stringsAsFactors=F)
   data_fort   <- fortify(newest.sldf)
   data_merged <- join(data_fort, shp.df, by="id")
   
-  ggplot() +  
+  ebc.plot.ls[[cc]] <- ggplot() +  
     geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey40", colour="grey90", alpha=1) +
     geom_path(data=data_merged, size=0.5, aes(x=long, y=lat, group=group, color=values)) +
     scale_color_gradientn(name="", colours = inferno(32)) +
@@ -116,29 +180,29 @@ for (cc in 1:length(unified.ls)) {
     theme(axis.title=element_blank(),
           axis.text=element_blank(),
           axis.ticks=element_blank(),
-          legend.position="right")
+          legend.position="right") +
+    labs(title=this.name)
   
-  
-  plot(newest.sldf$age, edge.bc.norm)
-  
-  
-  
-  
-  col.pal <- inferno(n=256)
-  col.vec <- col.pal[as.numeric(cut(log(1+edge.bc/1000), breaks=256))]
-  plot(newest.sldf, col = col.vec)
-  
-  
-  
-  plot(density(log(1+edge.bc)))
-  
-  
+  ## Prepare data for age vs betweenness plots
+  pl.df <- data.frame(year=2003-newest.sldf$age, ebc=ebc, gwid=this.gwid, name=this.name )
+  age.plot.ls[[cc]] <- pl.df
 }
 
+## Edge vs betweenness plots
+age.plot.df <- do.call("rbind", age.plot.ls)
+age.plot.df <- age.plot.df[order(age.plot.df$gwid),]
+cors <- ddply(age.plot.df, c("gwid", "name"), summarise, cor = round(cor(year, ebc), 2))
+
+ggplot(data = age.plot.df, aes(year, ebc)) + 
+  geom_point() + 
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~name) + 
+  labs(x="Road Age", y="Edge Betweenness") + 
+  geom_text(data=cors, aes(label=paste("r=", cor, sep="")), x=1990, y=20)
 
 
-
-
+## EBC maps
+grid.arrange(grobs=ebc.plot.ls, nrow=3)
 
 
 
