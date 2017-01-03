@@ -112,6 +112,23 @@ realvertex_edge_betweenness <- function(graph, normalize=FALSE) {
   return(ebc)
 }
 
+voronoipolygons = function(layer) {
+  require(deldir)
+  crds = layer@coords
+  z = deldir(crds[,1], crds[,2])
+  w = tile.list(z)
+  polys = vector(mode='list', length=length(w))
+  require(sp)
+  for (i in seq(along=polys)) {
+    pcrds = cbind(w[[i]]$x, w[[i]]$y)
+    pcrds = rbind(pcrds, pcrds[1,])
+    polys[[i]] = Polygons(list(Polygon(pcrds)), ID=as.character(i))
+  }
+  SP = SpatialPolygons(polys)
+  voronoi = SpatialPolygonsDataFrame(SP, data=data.frame(x=crds[,1], 
+                                                         y=crds[,2], row.names=sapply(slot(SP, 'polygons'), 
+                                                                                      function(x) slot(x, 'ID'))))
+}
 
 ######################################################################################
 # LOAD RN DATA
@@ -120,6 +137,7 @@ realvertex_edge_betweenness <- function(graph, normalize=FALSE) {
 ## Load data
 load("/home/hunzikp/Projects/roadvec/output/networks/country/roads_uni_full.RData")
 unified.ls <- full.list
+
 
 ######################################################################################
 # AGE VS EBC ANALYSIS
@@ -193,16 +211,140 @@ age.plot.df <- do.call("rbind", age.plot.ls)
 age.plot.df <- age.plot.df[order(age.plot.df$gwid),]
 cors <- ddply(age.plot.df, c("gwid", "name"), summarise, cor = round(cor(year, ebc), 2))
 
+pdf("/home/hunzikp/Projects/roadvec/output/plots/age_ebc.pdf", height=12, width=8)
 ggplot(data = age.plot.df, aes(year, ebc)) + 
   geom_point() + 
   geom_smooth(method="lm", se=FALSE) +
-  facet_wrap(~name) + 
+  facet_wrap(~name, nrow=4) + 
   labs(x="Road Age", y="Edge Betweenness") + 
   geom_text(data=cors, aes(label=paste("r=", cor, sep="")), x=1990, y=20)
-
+dev.off()
 
 ## EBC maps
-grid.arrange(grobs=ebc.plot.ls, nrow=3)
+pdf("/home/hunzikp/Projects/roadvec/output/plots/ebc.pdf", height=12, width=8)
+grid.arrange(grobs=ebc.plot.ls, nrow=4)
+dev.off()
+
+
+######################################################################################
+# COMMUNITIES
+######################################################################################
+
+greg.spdf <- readOGR("/home/hunzikp/Data/greg", "GREG")
+
+for (cc in 1:length(unified.ls)) {
+  
+  ## Get this country's sldf and polygon
+  unified.sldf <- unified.ls[[cc]]
+  this.gwid <- as.numeric(sub("c", "", names(unified.ls)[cc]))
+  cshp.all <- cshp(as.Date("2003-12-31"))
+  this.cshp <- cshp.all[cshp.all$GWCODE == this.gwid,]
+  this.name <- as.character(this.cshp$CNTRY_NAME)
+  this.greg <- greg.spdf[greg.spdf$COW==this.gwid,]
+  
+  ## Split unified into yearly SLDFs and calculate road age
+  unified.col.names <- names(unified.sldf)
+  unified.yearcol.names <- unified.col.names[grepl("map_", unified.col.names)]
+  unified.yearcol.years <- as.numeric(sub("[[:alnum:]]+_[[:graph:]]+_", "", unified.yearcol.names))
+  unified.yearcol.names <- unified.yearcol.names[order(unified.yearcol.years)]
+  unified.yearcol.years <- unified.yearcol.years[order(unified.yearcol.years)]
+  
+  flag.mat <- as.matrix(unified.sldf@data[,unified.yearcol.names])
+  firsttrue.vec <- apply(flag.mat, 1, function(x) which(x)[1])
+  firstbuilt.vec <- sapply(firsttrue.vec, function(x) unified.yearcol.years[x])
+  unified.sldf$firstyear <- firstbuilt.vec
+  
+  road.panel.ls <- vector("list", length(unified.yearcol.names))
+  for (i in 1:length(unified.yearcol.names)) {
+    this.year <- unified.yearcol.years[i]
+    this.sldf <- unified.sldf[unified.sldf@data[,unified.yearcol.names[i]],]
+    this.sldf@data <- this.sldf@data[,!(names(this.sldf) %in% unified.yearcol.names)]
+    this.sldf$age <- this.year - this.sldf$firstyear
+    road.panel.ls[[i]] <- this.sldf
+  }
+  
+  ## Get most recent network and simplify
+  newest.sldf <- road.panel.ls[[length(unified.yearcol.years)]]
+  newest.graph <- sldf2graph(newest.sldf)
+  E(newest.graph)$weight <- E(newest.graph)$length
+  simple.graph.ls <- simplify_network(newest.graph)
+  simple.graph <- simple.graph.ls[[1]]
+  
+  ## Remove small connected clusters from simple graph
+  cls <- clusters(simple.graph)
+  if (any(cls$csize==2)) {
+    single.edge.cls <- which(cls$csize==2)
+    for (idx in single.edge.cls) {
+      this.vertex.ids <- which(cls$membership==idx)
+      this.verteces <- V(simple.graph)[this.vertex.ids[1]]
+      this.edge <- E(simple.graph)[from(this.verteces[1])]
+      simple.graph <- delete.edges(simple.graph, this.edge)
+    }
+    edge.num <- unlist(lapply(V(simple.graph), function(x){length(incident(simple.graph, v = x, mode = c("all")))}))
+    simple.graph <- delete.vertices(simple.graph, which(edge.num == 0))
+  }
+  
+  ## Make simple sldf from simple graph
+  coords <- cbind(vertex_attr(simple.graph, "x", index = V(simple.graph)), 
+                  vertex_attr(simple.graph, "y", index = V(simple.graph)))
+  edges <- get.edges(simple.graph, E(simple.graph))
+  lines <- lapply(c(1:nrow(edges)), function(x){Lines(list(Line(coords[edges[x,],])), as.character(x))})
+  simple.sldf <- SpatialLinesDataFrame(SpatialLines(lines), data.frame(id=E(simple.graph)$id), FALSE)
+  
+  ## Make community dendrogram
+  community <- cluster_edge_betweenness(simple.graph, weights=E(simple.graph)$weight, directed=FALSE)
+  
+  N <- 4
+  split.plot.ls <- vector("list", N-1)
+  for (k in 2:N) {
+
+    # Calculate communities for given k
+    community$membership <- cut_at(community, no=k)
+    
+    # Crossing edges
+    crossing.bool <- crossing(community, simple.graph)
+    crossing.ids <- E(simple.graph)$id[crossing.bool]
+    
+    # Create community SLDF (with crossing edges removed)
+    this.sldf <- simple.sldf
+    this.sldf <- this.sldf[!(this.sldf$id %in% crossing.ids),]
+    
+    # Make areas for communities using voronoi tesselations
+    nodes.df <- data.frame(x=V(simple.graph)$x, y=V(simple.graph)$y, community=community$membership)
+    nds.sp <- SpatialPoints(nodes.df[,c(1:2)])
+    vrn.spdf <- voronoipolygons(nds.sp)
+    vrn.Polygons.ls <- vector("list", k)
+    for (i in 1:k) {
+      this.vrn.spdf <- vrn.spdf[nodes.df$community==i,]
+      this.vrn.spdf <- gUnionCascaded(this.vrn.spdf)
+      this.vrn.sp <- gIntersection(this.vrn.spdf, this.cshp)
+      vrn.Polygons.ls[[i]] <- Polygons(this.vrn.sp@polygons[[1]]@Polygons, as.character(i))
+    }
+    vrn.sp <- SpatialPolygons(vrn.Polygons.ls)
+    
+    # Plot communities
+    vrn.spdf <- SpatialPolygonsDataFrame(vrn.sp, data.frame(id=1:length(vrn.sp)))
+    vrn.points = fortify(vrn.spdf, region="id")
+    roads.fort <- fortify(this.sldf)
+    split.plot.ls[[k-1]] <- 
+      ggplot() + 
+      geom_polygon(data=vrn.points, aes(long, lat, group=group, fill=id)) + 
+      geom_path(data=roads.fort, aes(long, lat, group=group)) +
+      coord_equal(ratio=1) + 
+      theme(axis.title=element_blank(),
+            axis.text=element_blank(),
+            axis.ticks=element_blank(),
+            legend.position="none") +
+      labs(title=k) + 
+      scale_fill_manual(values=brewer.pal(k, "Set2")[1:k])
+  }
+  
+  grid.arrange(grobs=split.plot.ls)
+}
+
+
+
+
 
 
 
