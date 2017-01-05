@@ -23,6 +23,7 @@ library(viridisLite)
 library(ggplot2)
 library(gridExtra)
 source("sldf2graph.R")
+source("cluster_slnodes.R")
 
 
 ######################################################################################
@@ -230,9 +231,11 @@ dev.off()
 # COMMUNITIES
 ######################################################################################
 
-greg.spdf <- readOGR("/home/hunzikp/Data/greg", "GREG")
-
-for (cc in 1:length(unified.ls)) {
+process.countries <- c(1:8)
+community.sp.ls <- vector("list", length(process.countries))
+for (j in 1:length(process.countries)) {
+  
+  cc <- process.countries[j]
   
   ## Get this country's sldf and polygon
   unified.sldf <- unified.ls[[cc]]
@@ -240,7 +243,6 @@ for (cc in 1:length(unified.ls)) {
   cshp.all <- cshp(as.Date("2003-12-31"))
   this.cshp <- cshp.all[cshp.all$GWCODE == this.gwid,]
   this.name <- as.character(this.cshp$CNTRY_NAME)
-  this.greg <- greg.spdf[greg.spdf$COW==this.gwid,]
   
   ## Split unified into yearly SLDFs and calculate road age
   unified.col.names <- names(unified.sldf)
@@ -263,11 +265,13 @@ for (cc in 1:length(unified.ls)) {
     road.panel.ls[[i]] <- this.sldf
   }
   
-  ## Get most recent network and simplify
+  ## Get most recent network, cluster nodes, and simplify
   newest.sldf <- road.panel.ls[[length(unified.yearcol.years)]]
-  newest.graph <- sldf2graph(newest.sldf)
-  E(newest.graph)$weight <- E(newest.graph)$length
-  simple.graph.ls <- simplify_network(newest.graph)
+  newest.sldf <- spChFIDs(newest.sldf, rownames(newest.sldf@data))
+  clustered.sldf <- cluster_slnodes(newest.sldf , eps=0.05, MinPts=2)
+  clustered.graph <- sldf2graph(clustered.sldf)
+  E(clustered.graph)$weight <- E(clustered.graph)$length
+  simple.graph.ls <- simplify_network(clustered.graph)
   simple.graph <- simple.graph.ls[[1]]
   
   ## Remove small connected clusters from simple graph
@@ -294,8 +298,9 @@ for (cc in 1:length(unified.ls)) {
   ## Make community dendrogram
   community <- cluster_edge_betweenness(simple.graph, weights=E(simple.graph)$weight, directed=FALSE)
   
-  N <- 4
-  split.plot.ls <- vector("list", N-1)
+  N <- 6
+  split.voronoi.ls <- vector("list", N-1)
+  split.network.ls <- split.voronoi.ls
   for (k in 2:N) {
 
     # Calculate communities for given k
@@ -322,33 +327,122 @@ for (cc in 1:length(unified.ls)) {
     }
     vrn.sp <- SpatialPolygons(vrn.Polygons.ls)
     
-    # Plot communities
-    vrn.spdf <- SpatialPolygonsDataFrame(vrn.sp, data.frame(id=1:length(vrn.sp)))
-    vrn.points = fortify(vrn.spdf, region="id")
-    roads.fort <- fortify(this.sldf)
-    split.plot.ls[[k-1]] <- 
-      ggplot() + 
-      geom_polygon(data=vrn.points, aes(long, lat, group=group, fill=id)) + 
-      geom_path(data=roads.fort, aes(long, lat, group=group)) +
-      coord_equal(ratio=1) + 
-      theme(axis.title=element_blank(),
-            axis.text=element_blank(),
-            axis.ticks=element_blank(),
-            legend.position="none") +
-      labs(title=k) + 
-      scale_fill_manual(values=brewer.pal(k, "Set2")[1:k])
+    split.voronoi.ls[[k-1]] <- vrn.sp
+    split.network.ls[[k-1]] <- this.sldf
   }
   
-  grid.arrange(grobs=split.plot.ls)
+  community.sp.ls[[j]] <- list(split.voronoi.ls, split.network.ls)
+  names(community.sp.ls)[j] <- paste0("c", this.gwid)
 }
 
 
+#### Plot two communities for all countries
+tc.plot.ls <- vector("list", length(community.sp.ls))
+for (cc in 1:length(community.sp.ls)) {
+  
+  k <- 2
+  
+  vrn.sp.ls <- community.sp.ls[[cc]][[1]]
+  community.sldf.ls <- community.sp.ls[[cc]][[2]]
+  vrn.sp <- vrn.sp.ls[[1]]
+  community.sldf <- community.sldf.ls[[1]]
+  
+  vrn.df <- data.frame(id=1:length(vrn.sp))
+  vrn.spdf <- SpatialPolygonsDataFrame(vrn.sp, vrn.df, FALSE)
+  vrn.points = fortify(vrn.spdf, region="id")
+  roads.fort <- fortify(community.sldf)
+  
+  tc.plot.ls[[cc]] <- ggplot() + 
+    geom_polygon(data=vrn.points, aes_string("long", "lat", group="group", fill="id")) + 
+    geom_path(data=roads.fort, aes(long, lat, group=group)) +
+    coord_equal(ratio=1) + 
+    theme(axis.title=element_blank(),
+          axis.text=element_blank(),
+          axis.ticks=element_blank(),
+          legend.position="none") +
+    scale_fill_manual(values=viridis(k)[1:k], drop=F)
+}
+
+grid.arrange(grobs=tc.plot.ls)
 
 
+#### Plot two communities for nigeria
+vrn.sp.ls <- community.sp.ls$c475[[1]]
+community.sldf.ls <- community.sp.ls$c475[[2]]
+vrn.sp <- vrn.sp.ls[[1]]
+community.sldf <- community.sldf.ls[[1]]
 
+vrn.df <- data.frame(id=1:length(vrn.sp))
+vrn.spdf <- SpatialPolygonsDataFrame(vrn.sp, vrn.df, FALSE)
+vrn.points = fortify(vrn.spdf, region="id")
+roads.fort <- fortify(community.sldf)
 
+pdf("/home/hunzikp/Projects/roadvec/output/plots/nigeria_2.pdf")
+ggplot() + 
+geom_polygon(data=vrn.points, aes_string("long", "lat", group="group", fill="id")) + 
+geom_path(data=roads.fort, aes(long, lat, group=group)) +
+coord_equal(ratio=1) + 
+theme(axis.title=element_blank(),
+      axis.text=element_blank(),
+      axis.ticks=element_blank(),
+      legend.position="none") +
+scale_fill_manual(values=viridis(k)[1:k], drop=F)
+dev.off()
 
+#### Plot Nigeria with six communities, next to six largest ethnic groups
+# communties
+k <- 6
+vrn.sp.ls <- community.sp.ls$c475[[1]]
+community.sldf.ls <- community.sp.ls$c475[[2]]
+vrn.sp <- vrn.sp.ls[[k-1]]
+community.sldf <- community.sldf.ls[[k-1]]
 
+vrn.df <- data.frame(id=1:length(vrn.sp))
+vrn.spdf <- SpatialPolygonsDataFrame(vrn.sp, vrn.df, FALSE)
+vrn.points = fortify(vrn.spdf, region="id")
+roads.fort <- fortify(community.sldf)
+
+community.gplot <- ggplot() + 
+  geom_polygon(data=vrn.points, aes_string("long", "lat", group="group", fill="id")) + 
+  geom_path(data=roads.fort, aes(long, lat, group=group)) +
+  coord_equal(ratio=1) + 
+  theme(axis.title=element_blank(),
+        axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        legend.position="none") +
+  scale_fill_manual(values=viridis(k)[1:k], drop=F)
+
+# ethnic groups
+this.greg <- greg.spdf[greg.spdf$COW==475,]
+grpnums <- unique(this.greg$GROUP1)
+grpnames <- as.character(unique(this.greg$G1SHORTNAM))
+greg.Polygons.ls <- vector("list", length(grpnums))
+for (i in 1:length(grpnums)) {
+  grpnum <- grpnums[i]
+  this.group <- this.greg[this.greg$GROUP1==grpnum,]
+  this.group <- gUnionCascaded(this.group)
+  greg.Polygons.ls[[i]] <- Polygons(this.group@polygons[[1]]@Polygons, as.character(i))
+}
+this.greg.sp <- SpatialPolygons(greg.Polygons.ls)
+this.greg.spdf <- SpatialPolygonsDataFrame(this.greg.sp, data.frame(id=1:length(grpnums), name=as.character(grpnames), stringsAsFactors = FALSE), FALSE)
+this.greg.spdf$size <- gArea(this.greg.spdf, byid=TRUE)
+largest.ids <- (this.greg.spdf$id[order(-this.greg.spdf$size)])[1:k]
+largest.greg.spdf <- this.greg.spdf[this.greg.spdf$id %in% largest.ids,]
+
+largest.points <- fortify(largest.greg.spdf, region="id")
+largest.merged <- join(largest.points, largest.greg.spdf@data, by="id")
+ethnic.gplot <- ggplot() + 
+  geom_polygon(data=largest.merged, aes(long, lat, group=group, fill=as.factor(name))) + 
+  coord_equal(ratio=1) + 
+  theme(axis.title=element_blank(),
+        axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        legend.position="right") +
+  scale_fill_manual("", values=viridis(k)[c(3,1,6,5,2,4)], drop=F)
+
+pdf("/home/hunzikp/Projects/roadvec/output/plots/nigeria_6.pdf", height=4, width=10)
+grid.arrange(community.gplot, ethnic.gplot, ncol=2, widths=c(5.6,8))
+dev.off()
 
 
 ######################################################################################
