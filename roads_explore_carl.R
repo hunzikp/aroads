@@ -22,35 +22,72 @@ library(ggplot2)
 library(gridExtra)
 source("sldf2graph.R")
 
+fig.path <- "figures/"
 
 ######################################################################################
 # FUNCTIONS
 ######################################################################################
 
+
 # Generate simplified network with nodes at intersections & endpoints only
-simplify_network <- function(graph){
+simplify_network <- function(graph) {
   
   # Find all vertices with only two edges
   edge.num <- unlist(lapply(V(graph), function(x){length(incident(graph, v = x, mode = c("all")))}))
   vertices.bridge <- which(edge.num == 2)
   
+  E(graph)$id <- 1:length(E(graph))
+  reference.ls <- vector("list", length(vertices.bridge))
+  
+  out.graph <- graph
+  
   # Sequentially (!) delete old edges and replace them with a bridging one
+  new.id <- max(E(graph)$id) + 1
+  cntr <- 1
   for(v in vertices.bridge){
-    these.neighbors <- neighbors(graph, v, mode =  "all")
-    old.edges <- E(graph)[from(v)]
+    these.neighbors <- neighbors(out.graph, v, mode =  "all")
+    old.edges <- E(out.graph)[from(v)]
+    old.ids <- old.edges$id
+    
     # Add new edge
-    graph <- add_edges(graph, these.neighbors,
-                       attr = list(weight = sum(edge_attr(graph, "weight", old.edges))))
+    out.graph <- add_edges(out.graph, these.neighbors,
+                           attr = list(weight = sum(edge_attr(out.graph, "weight", old.edges)), id=new.id))
+    
     # Delede old edges
-    graph <- delete.edges(graph, E(graph)[from(v)])
+    out.graph <- delete.edges(out.graph, E(out.graph)[from(v)])
+    
+    # Update reference list
+    reference.ls[[cntr]] <- cbind(new.id, old.ids)
+    
+    # Increase id
+    new.id <- new.id + 1
+    cntr <- cntr + 1
   }
   
   # Delete now unconnected vertices
-  graph <- delete.vertices(graph, c(vertices.bridge, which(edge.num == 0)))
+  out.graph <- delete.vertices(out.graph, c(vertices.bridge, which(edge.num == 0)))
   
-  return(graph)
+  # Make reference table
+  reference.mat <- do.call("rbind", reference.ls)
+  reference.df <- data.frame(original.id=E(graph)$id, new.id=NA)
+  replaced.edges <- E(graph)$id[E(graph)$id %in% reference.mat[,2]]
+  reference.df$new.id[!(reference.df$original.id %in% replaced.edges)] <- reference.df$original.id[!(reference.df$original.id %in% replaced.edges)]
+  for (i in 1:length(replaced.edges)) {
+    original.id <- replaced.edges[i]
+    parent.id <- reference.mat[reference.mat[,2]==original.id,1]
+    hasparent <- TRUE
+    while (hasparent) {
+      candidate.parent.id <- reference.mat[reference.mat[,2]==parent.id,1]
+      hasparent <- length(candidate.parent.id) > 0
+      if (hasparent) {
+        parent.id <- candidate.parent.id
+      }
+    }
+    reference.df$new.id[reference.df$original.id==original.id] <- parent.id
+  }
+  
+  return(list(out.graph, reference.df))
 }
-
 
 ## Read Spatial DataFrame from PostgreSQL
 dbReadSpatial <- function(con, schemaname="public", tablename, geomcol="the_geom", idcol=NULL, where="") {
@@ -113,17 +150,182 @@ dbReadSpatial <- function(con, schemaname="public", tablename, geomcol="the_geom
   return(spatial.df)
 }
 
+realvertex_vertex_betweenness <- function(graph, normalize=FALSE) {
+  
+  ## Simplify and get reference table
+  simple.graph.ls <- simplify_network(graph)
+  simple.graph <- simple.graph.ls[[1]]
+  reference.df <- simple.graph.ls[[2]]
+  
+  ## Calculate edge betweenness on simplified graph
+  vbc.simple <- betweenness(simple.graph)
+  if (normalize) {
+    vbc.simple <- vbc.simple / ((length(V(simple.graph))-1)*(length(V(simple.graph))-2))
+  }
+  
+  ## Merge simple ebc back to original edges
+  vertex_attr(simple.graph, "x")
+  simple.vbc.df <- data.frame(x = vertex_attr(simple.graph, "x"),
+                              y = vertex_attr(simple.graph, "y"),
+                              vbc=vbc.simple)
+  coordinates(simple.vbc.df) <- c("x","y")
+  return(simple.vbc.df)
+}
+
+realvertex_edge_betweenness <- function(graph, normalize=FALSE) {
+  
+  ## Simplify and get reference table
+  simple.graph.ls <- simplify_network(graph)
+  simple.graph <- simple.graph.ls[[1]]
+  reference.df <- simple.graph.ls[[2]]
+  
+  ## Calculate edge betweenness on simplified graph
+  ebc.simple <- edge_betweenness(simple.graph)
+  if (normalize) {
+    ebc.simple <- ebc.simple / ((length(V(simple.graph))-1)*(length(V(simple.graph))-2))
+  }
+  
+  ## Merge simple ebc back to original edges
+  simple.ebc.df <- data.frame(new.id=E(simple.graph)$id, ebc=ebc.simple)
+  reference.df <- merge(reference.df, simple.ebc.df, by="new.id", all.x=TRUE, all.y=FALSE)
+  
+  ## Order and out
+  reference.df <- reference.df[order(reference.df$original.id),]
+  ebc <- reference.df$ebc
+  return(ebc)
+}
+
+voronoipolygons = function(layer) {
+  require(deldir)
+  crds = layer@coords
+  z = deldir(crds[,1], crds[,2])
+  w = tile.list(z)
+  polys = vector(mode='list', length=length(w))
+  require(sp)
+  for (i in seq(along=polys)) {
+    pcrds = cbind(w[[i]]$x, w[[i]]$y)
+    pcrds = rbind(pcrds, pcrds[1,])
+    polys[[i]] = Polygons(list(Polygon(pcrds)), ID=as.character(i))
+  }
+  SP = SpatialPolygons(polys)
+  voronoi = SpatialPolygonsDataFrame(SP, data=data.frame(x=crds[,1], 
+                                                         y=crds[,2], row.names=sapply(slot(SP, 'polygons'), 
+                                                                                      function(x) slot(x, 'ID'))))
+}
+
 ######################################################################################
 # LOAD RN DATA
 ######################################################################################
 library(RPostgreSQL)
-con_growup <- dbConnect(dbDriver("PostgreSQL"), dbname="dbname", 
-                        port=5432, host="host", 
-                        user="user", password="pw")
+# con_growup <- dbConnect(dbDriver("PostgreSQL"), dbname="dbname", 
+#                         port=5432, host="host", 
+#                         user="user", password="pw")
 ## Load data
 load("~/Data/Roads/Bluebooks/preliminary/roads_uni_full.RData")
 unified.ls <- full.list
 
+######################################################################################
+# AGE VS EBC ANALYSIS
+######################################################################################
+
+ebc.plot.ls <- vector("list", length(unified.ls))
+age.plot.ls <- vector("list", length(unified.ls))
+for (cc in 1:length(unified.ls)) {
+  
+  ## Get this country's sldf and polygon
+  unified.sldf <- unified.ls[[cc]]
+  this.gwid <- as.numeric(sub("c", "", names(unified.ls)[cc]))
+  cshp.all <- cshp(as.Date("2003-12-31"))
+  this.cshp <- cshp.all[cshp.all$GWCODE == this.gwid,]
+  this.name <- as.character(this.cshp$CNTRY_NAME)
+  
+  ## Split unified into yearly SLDFs and calculate road age
+  unified.col.names <- names(unified.sldf)
+  unified.yearcol.names <- unified.col.names[grepl("map_", unified.col.names)]
+  unified.yearcol.years <- as.numeric(sub("[[:alnum:]]+_[[:graph:]]+_", "", unified.yearcol.names))
+  unified.yearcol.names <- unified.yearcol.names[order(unified.yearcol.years)]
+  unified.yearcol.years <- unified.yearcol.years[order(unified.yearcol.years)]
+  
+  flag.mat <- as.matrix(unified.sldf@data[,unified.yearcol.names])
+  firsttrue.vec <- apply(flag.mat, 1, function(x) which(x)[1])
+  firstbuilt.vec <- sapply(firsttrue.vec, function(x) unified.yearcol.years[x])
+  unified.sldf$firstyear <- firstbuilt.vec
+  
+  road.panel.ls <- vector("list", length(unified.yearcol.names))
+  for (i in 1:length(unified.yearcol.names)) {
+    this.year <- unified.yearcol.years[i]
+    this.sldf <- unified.sldf[unified.sldf@data[,unified.yearcol.names[i]]==1,]
+    this.sldf@data <- this.sldf@data[,!(names(this.sldf) %in% unified.yearcol.names)]
+    this.sldf$age <- this.year - this.sldf$firstyear
+    road.panel.ls[[i]] <- this.sldf
+  }
+  
+  ## Calculate EBC for most recent network
+  newest.sldf <- road.panel.ls[[length(road.panel.ls)]]
+  newest.graph <- sldf2graph(newest.sldf)
+  E(newest.graph)$weight <- E(newest.graph)$length
+  ebc <- realvertex_edge_betweenness(newest.graph, normalize=TRUE) 
+  ebc <- ebc*100
+
+  ## Calculate VBC for most recent network
+  vbc <- realvertex_vertex_betweenness(newest.graph, normalize=TRUE) 
+  vbc$vbc <- vbc$vbc*100
+  
+  ## Plot normalized edge betweenness
+  
+  #Fortify edges
+  newest.sldf <- spChFIDs(newest.sldf, rownames(newest.sldf@data))
+  shp.df    <- data.frame(id=rownames(newest.sldf@data),
+                          values=ebc,
+                          newest.sldf@data, stringsAsFactors=F)
+  data_fort   <- fortify(newest.sldf)
+  data_merged <- join(data_fort, shp.df, by="id")
+  
+  #Fortify vertices
+  vbc.df    <- data.frame(id=rownames(vbc@data),
+                          long = coordinates(vbc)[,1],
+                          lat = coordinates(vbc)[,2],
+                          values=vbc$vbc, stringsAsFactors=F)
+
+  
+  ebc.plot.ls[[cc]] <- ggplot() +  
+    geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
+    geom_path(data=data_merged, size=0.5, aes(x=long, y=lat, group=group, color=values)) +
+    geom_point(data=vbc.df, size=2, aes(x=long, y=lat, color=values)) +
+    scale_color_gradientn(name="", colours = inferno(32)) +
+    coord_equal(ratio=1) + 
+    theme(axis.title=element_blank(),
+          axis.text=element_blank(),
+          axis.ticks=element_blank(),
+          legend.position="right") +
+    labs(title=this.name)
+  
+  ## Prepare data for age vs betweenness plots
+  pl.df <- data.frame(year=2003-newest.sldf$age, ebc=ebc, gwid=this.gwid, name=this.name )
+  age.plot.ls[[cc]] <- pl.df
+}
+
+## Edge vs betweenness plots
+labels = c(`500` = "Uganda",`452` = "Ghana",`475` = "Nigeria",`501` = "Kenya",`553` = "Malawi",`551` = "Zambia",`451` = "Sierra Leone",`510` = "Tanzania")
+
+age.plot.df <- do.call("rbind", age.plot.ls)
+age.plot.df <- age.plot.df[order(age.plot.df$gwid),]
+cors <- ddply(age.plot.df, c("gwid", "name"), summarise, cor = round(cor(year, ebc), 2))
+age.plot.df$name <- as.character(age.plot.df$name)
+pdf(file=paste0(fig.path,"age_ebc.pdf"), width = 12, height=5)
+ggplot(data = age.plot.df, aes(year, ebc, group = name)) + 
+  geom_point() + 
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~name, nrow=2) + 
+  labs(x="Road Age", y="Edge Betweenness") + 
+  geom_text(data=cors, aes(label=paste("r=", cor, sep="")), x=1990, y=20)
+dev.off()
+
+## EBC maps
+ebc.plot.ord <- lapply(labels[order(labels)], function(x){ebc.plot.ls[[which(labels == x)]]})
+pdf(file=paste0(fig.path,"ebc.pdf"), width = 8, height=12)
+grid.arrange(grobs=ebc.plot.ord, nrow=4)
+dev.off()
 
 
 ###########################################
@@ -177,9 +379,9 @@ for (cc in 1:length(unified.ls)) {
     new.vert <- get.edges(this.sldf[[2]], E(this.sldf[[2]])[this.sldf[[1]]@data$firstyear == max(this.sldf[[1]]@data$firstyear)])
     edge.num <- unlist(lapply(new.vert, function(x){length(incident(this.sldf[[2]], v = x, mode = c("all")))}))
     new.deadend.all <- rbind(new.deadend.all,
-                              cbind(year =  max(this.sldf[[1]]@data$firstyear),
-                                    deadend.ratio = sum(edge.num == 1) / (sum(edge.num != 2)),
-                                    gwid = this.gwid))
+                             cbind(year =  max(this.sldf[[1]]@data$firstyear),
+                                   deadend.ratio = sum(edge.num == 1) / (sum(edge.num != 2)),
+                                   gwid = this.gwid))
   }
   newebc.panel.mat <- data.frame(newebc.panel.mat)
   color.scale <- unique(inferno(256)[cut(newebc.panel.mat$year, 256)])
@@ -211,36 +413,36 @@ for (cc in 1:length(unified.ls)) {
   new.ebc.all <- rbind(new.ebc.all,
                        cbind(gwid = this.gwid, newebc.panel.agg))
   
-
+  
   
   #Exploratory vs densifying roads 
   
   ## Plot normalized edge betweenness of new edges
-#   plot.ls <- list()
-#   for( i in road.panel.ls){
-#     newest.sldf <- spChFIDs(i[[1]], rownames(i[[1]]@data))
-#     newest.graph <- sldf2graph(newest.sldf)
-#     edge.bc <- edge_betweenness(newest.graph, e = E(newest.graph), directed = F, weights=E(newest.graph)$length)
-#     edge.bc.norm <- (edge.bc / ((length(V(newest.graph))-1)*(length(V(newest.graph))-2)))*100
-#     shp.df    <- data.frame(id=rownames(newest.sldf@data),
-#                             values=edge.bc.norm,
-#                             newest.sldf@data, stringsAsFactors=F)
-#     shp.df$values[newest.sldf@data$firstyear != max(newest.sldf@data$firstyear, na.rm = T)] <- NA
-#     data_fort   <- fortify(newest.sldf)
-#     data_merged <- join(data_fort, shp.df, by="id")
-#     plot.ls <- c(plot.ls, list(data_merged))
-#   }
-# 
-#   
-#   ggplot() +  
-#     geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey40", colour="grey90", alpha=1) +
-#     geom_path(data=plot.ls[[7]], size=0.5, aes(x=long, y=lat, group=group, color=values)) +
-#     scale_color_gradientn(limits = c(0,25), name="", colours = inferno(32)) +
-#     coord_equal(ratio=1) + 
-#     theme(axis.title=element_blank(),
-#           axis.text=element_blank(),
-#           axis.ticks=element_blank(),
-#           legend.position="right")
+  #   plot.ls <- list()
+  #   for( i in road.panel.ls){
+  #     newest.sldf <- spChFIDs(i[[1]], rownames(i[[1]]@data))
+  #     newest.graph <- sldf2graph(newest.sldf)
+  #     edge.bc <- edge_betweenness(newest.graph, e = E(newest.graph), directed = F, weights=E(newest.graph)$length)
+  #     edge.bc.norm <- (edge.bc / ((length(V(newest.graph))-1)*(length(V(newest.graph))-2)))*100
+  #     shp.df    <- data.frame(id=rownames(newest.sldf@data),
+  #                             values=edge.bc.norm,
+  #                             newest.sldf@data, stringsAsFactors=F)
+  #     shp.df$values[newest.sldf@data$firstyear != max(newest.sldf@data$firstyear, na.rm = T)] <- NA
+  #     data_fort   <- fortify(newest.sldf)
+  #     data_merged <- join(data_fort, shp.df, by="id")
+  #     plot.ls <- c(plot.ls, list(data_merged))
+  #   }
+  # 
+  #   
+  #   ggplot() +  
+  #     geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey40", colour="grey90", alpha=1) +
+  #     geom_path(data=plot.ls[[7]], size=0.5, aes(x=long, y=lat, group=group, color=values)) +
+  #     scale_color_gradientn(limits = c(0,25), name="", colours = inferno(32)) +
+  #     coord_equal(ratio=1) + 
+  #     theme(axis.title=element_blank(),
+  #           axis.text=element_blank(),
+  #           axis.ticks=element_blank(),
+  #           legend.position="right")
   
   
 }
@@ -252,9 +454,11 @@ new.ebc.all$cowname <- ""
 for(l in 1:length(labels)){
   new.ebc.all$cowname[new.ebc.all$gwid == as.numeric(names(labels)[l])] <- labels[l]
 }
+pdf(file=paste0(fig.path,"newroads_ebc.pdf"), width = 12, height=5)
 ggplot(new.ebc.all, aes(x = year, y = ebc, group = cowname)) +
   geom_point()  + facet_wrap(~cowname, nrow = 2) +  xlab("Year") + ylab("Edge betweenness centrality") + 
   geom_smooth(method = "lm",formula = y ~x + I(x^2), se = F) ## formula = y~x+I(x^2)
+dev.off()
 ### Interpretable as decreasing marginal utility of new roads.
 
 
@@ -265,10 +469,11 @@ new.deadend.all$cowname <- ""
 for(l in 1:length(labels)){
   new.deadend.all$cowname[new.deadend.all$gwid == as.numeric(names(labels)[l])] <- labels[l]
 }
+pdf(file=paste0(fig.path,"newroads_deadends.pdf"), width = 12, height=5)
 ggplot(new.deadend.all, aes(x = year, y = deadend.ratio, group = cowname)) +
   geom_point()  + facet_wrap(~cowname, nrow = 2) +  xlab("Year") + ylab("Fraction of deadends") + 
   geom_smooth(method = "lm",formula = y ~x , se = F) ## formula = y~x+I(x^2)
-
+dev.off()
 
 #################################
 ## Maps over time ##########
@@ -287,8 +492,8 @@ for (cc in 1:length(unified.ls)) {
   ## Road Length
   length.km <- lapply(unified.sldf@lines, 
                       function(x){sum(unlist(lapply(c(2:nrow(x@Lines[[1]]@coords)), 
-                                            function(y){distHaversine(x@Lines[[1]]@coords[y-1,],
-                                                                      x@Lines[[1]]@coords[y,])})))})
+                                                    function(y){distHaversine(x@Lines[[1]]@coords[y-1,],
+                                                                              x@Lines[[1]]@coords[y,])})))})
   unified.sldf$length.km <- unlist(length.km)/1000
   ## Split unified into yearly SLDFs and calculate road age
   unified.col.names <- names(unified.sldf)
@@ -301,7 +506,7 @@ for (cc in 1:length(unified.ls)) {
   firsttrue.vec <- apply(flag.mat, 1, function(x) which(x)[1])
   firstbuilt.vec <- sapply(firsttrue.vec, function(x) unified.yearcol.years[x])
   unified.sldf$firstyear <- firstbuilt.vec
-
+  
   road.panel.ls <- vector("list", length(unified.yearcol.names))
   for (i in 1:length(unified.yearcol.names)) {
     this.year <- unified.yearcol.years[i]
@@ -310,35 +515,50 @@ for (cc in 1:length(unified.ls)) {
     this.sldf$age <- this.year - this.sldf$firstyear
     road.panel.ls[[i]] <- list(this.sldf)
   }
-
+  
   # Plot pure
-#   for(i in road.panel.ls){
-#     sldf <- fortify(i[[1]])
-#     p <- ggplot() +  
-#       geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
-#       geom_path(data=sldf, size=0.5, aes(x=long, y=lat, group = group)) + coord_equal(ratio=1) + 
-#       theme(axis.title=element_blank(),
-#             axis.text=element_blank(),
-#             axis.ticks=element_blank(),
-#             legend.position="right")
-#     print(p)
-#   }
+  #   for(i in road.panel.ls){
+  #     sldf <- fortify(i[[1]])
+  #     p <- ggplot() +  
+  #       geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
+  #       geom_path(data=sldf, size=0.5, aes(x=long, y=lat, group = group)) + coord_equal(ratio=1) + 
+  #       theme(axis.title=element_blank(),
+  #             axis.text=element_blank(),
+  #             axis.ticks=element_blank(),
+  #             legend.position="right")
+  #     print(p)
+  #   }
   # Plot with new roads in red
   col.new.road = "red"
   p.list <- list()
+  count = 0
   for(i in road.panel.ls){
+    count = count + 1
     #Road plot
     shp.df    <- data.frame(id=i[[1]]@data$hlid,i[[1]]@data, stringsAsFactors=F)
     sldf <- join(fortify(i[[1]]), shp.df, by = "id")
-    p <- ggplot() +  
-      geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
-      geom_path(data=sldf, size=0.5, aes(x=long, y=lat, group = group)) + coord_equal(ratio=1) + 
-      geom_path(data=sldf[sldf$firstyear == max(sldf$firstyear),], size=0.5, aes(x=long, y=lat, group = group, color = col.new.road)) + 
-      ggtitle(max(sldf$firstyear)) + 
-      theme(axis.title=element_blank(),
-            axis.text=element_blank(),
-            axis.ticks=element_blank(),
-            legend.position="none")
+    any.new <- any(sldf$firstyear == unified.yearcol.years[count])
+    if(any.new){
+      p <- ggplot() +  
+        geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
+        geom_path(data=sldf, size=0.5, aes(x=long, y=lat, group = group)) + coord_equal(ratio=1) + 
+        geom_path(data=sldf[sldf$firstyear == unified.yearcol.years[count],], size=0.5, aes(x=long, y=lat, group = group, color = col.new.road)) + 
+        ggtitle(unified.yearcol.years[count]) + 
+        theme(axis.title=element_blank(),
+              axis.text=element_blank(),
+              axis.ticks=element_blank(),
+              legend.position="none")
+    } else {
+      p <- ggplot() +  
+        geom_polygon(data=this.cshp, aes(x=long, y=lat, group=group), fill="grey80", colour="grey90", alpha=1) +
+        geom_path(data=sldf, size=0.5, aes(x=long, y=lat, group = group)) + coord_equal(ratio=1) + 
+        ggtitle(unified.yearcol.years[count]) + 
+        theme(axis.title=element_blank(),
+              axis.text=element_blank(),
+              axis.ticks=element_blank(),
+              legend.position="none")
+    }
+
     p.list <- c(p.list,list(p))
     
     ## Calculate Road density
@@ -350,7 +570,9 @@ for (cc in 1:length(unified.ls)) {
                              c(area = area, road.length = road.length, year = max(i[[1]]@data$firstyear),gwid = this.gwid))
     
   }
+  png(file=paste0(fig.path,this.gwid,"_mappanel.png"), width = 10, height=5, units = "in",res = 600)
   grid.arrange(grobs = p.list, nrow = 2)
+  dev.off()
 }
 
 #Plot road length/density over time
@@ -360,10 +582,11 @@ length.year.mat$cowname <- ""
 for(l in 1:length(labels)){
   length.year.mat$cowname[length.year.mat$gwid == as.numeric(names(labels)[l])] <- labels[l]
 }
+pdf(file=paste0(fig.path,"road_density.pdf"), width = 12, height=5)
 ggplot(length.year.mat, aes(x = year, y = road.length/area, group = cowname)) +
   geom_point()  + facet_wrap(~cowname, nrow = 2) +  xlab("Year") + ylab("Road density (km/km^2)") + 
   geom_smooth(method = "loess", se = F) ## formula = y~x+I(x^2)
-
+dev.off()
 ##################################
 # Plot some (apparent) anomalies
 ##################################
@@ -415,7 +638,9 @@ p <- ggplot() +
         legend.background = element_rect(fill="transparent"),
         legend.text=element_text(size=12)) + 
   guides(colour=guide_legend(override.aes=list(fill="grey90")), fill = F, size = F)
+png(file=paste0(fig.path,"500_water.png"), width = 7, height=7, units = "in",res = 600)
 print(p)
+dev.off()
 
 # Nigeria
 cc <- "c475"
@@ -458,7 +683,11 @@ p <- ggplot() +
         legend.background = element_rect(fill="transparent"),
         legend.text=element_text(size=12)) + 
   guides(colour=guide_legend(override.aes=list(fill="grey90")), fill = F, size = F)
+
+png(file=paste0(fig.path,"475_water.png"), width = 9, height=7, units = "in",res = 600)
 print(p)
+dev.off()
+
 # Something is wrong here - Rivers and roads do not allign... Check projections
 
 
@@ -493,10 +722,45 @@ p <- ggplot() +
         legend.justification=c(1,0), legend.position=c(1,0),
         legend.background = element_rect(fill="transparent"),
         legend.text=element_text(size=12))
+png(file=paste0(fig.path,"451_railway.png"), width = 7, height=7, units = "in",res = 600)
 print(p)
+dev.off()
 
 
+#################################
+# ROADS TIMELINE / TABLE WITH YEARS per COUNTRY
+######################################
+labels = c(`500` = "Uganda",`452` = "Ghana",`475` = "Nigeria",`501` = "Kenya",
+           `553` = "Malawi",`551` = "Zambia",`451` = "Sierra Leone",`510` = "Tanzania")
+labels <- labels[order(labels, decreasing = F)]
+# Make plot of country years for which road lists are converted
+year.start <- 1890
+year.end <- 2010
+pdf(file=paste0(fig.path,"roads_timeline.pdf"), width = 12, height=5)
+plot(NA, xlim=c(year.start,year.end),
+     bty='n',yaxt="n", xaxt="n", ylab="", xlab="Year", col="black", ylim = c(0,length(labels)))
 
+for(c in seq(1, length(labels), by = 2)){
+  rect(year.start, c-0.5, year.end, c+0.5, 
+       col = "lightgrey", border = NA)
+}
 
-
+count = length(labels) + 1
+for(cc in 1:length(labels)){
+  count = count - 1
+  unified.sldf <- unified.ls[[paste0("c",names(labels)[cc])]]
+  unified.col.names <- names(unified.sldf)
+  unified.yearcol.names <- unified.col.names[grepl("map_", unified.col.names)]
+  unified.yearcol.years <- as.numeric(sub("[[:alnum:]]+_[[:graph:]]+_", "", unified.yearcol.names))
+  # Michelin
+  points(unified.yearcol.years[!grepl("_bb_",unified.yearcol.names)],rep(count, length(unified.yearcol.years[!grepl("_bb_",unified.yearcol.names)])), 
+         pch=3, col="black", cex = 1.75)
+  # Bluebook
+  points(unified.yearcol.years[grepl("_bb_",unified.yearcol.names)],rep(count, length(unified.yearcol.years[grepl("_bb_",unified.yearcol.names)])), 
+         pch=4, col="black", cex = 1.75)
+}
+axis(1, at=c(year.start,seq(1900, 2000, by= 25), year.end))
+labels <- labels[order(labels, decreasing = T)]
+axis(2, at=c(1:length(labels)), labels=labels, las=1, tick=F, lwd=0, pos=1890)
+dev.off()
 
