@@ -34,7 +34,7 @@ require(dbscan)
 #'
 
 
-cluster_slnodes <- function(sldf, eps, MinPts){
+cluster_slnodes <- function(sldf, eps=0.05, MinPts=2){
   # Points as start and endpoints of Lines
   points <- SpatialPoints(unique(rbind(do.call(rbind,lapply(sldf@lines, function(x){x@Lines[[1]]@coords[1,]})),
                                        do.call(rbind,lapply(sldf@lines, function(x){x@Lines[[1]]@coords[nrow(x@Lines[[1]]@coords),]})))))
